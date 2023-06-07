@@ -33,29 +33,56 @@ namespace MyCineListFunctions
 
                 List<ImageMovie>? imageList = new List<ImageMovie>();
                 DataTable imagesTable = GetUrlImageToResize();
+                
+                string? Connection = Environment.GetEnvironmentVariable("AzureWebJobsStorage");
+                string? containerName = Environment.GetEnvironmentVariable("ContainerName");
+                var blobClient = new BlobContainerClient(Connection, containerName);
 
                 foreach (DataRow row in imagesTable.Rows)
                 {
                     string? imdbPrimaryImageUrl = row["ImdbPrimaryImageUrl"].ToString();
                     string? imdbID = row["IMDBID"].ToString();
-
+                    
                     if (imdbPrimaryImageUrl != null && imdbID != null)
                     {
-                        using (var client = new HttpClient())
-                        {
-                            var clientResponse = await client.GetAsync(imdbPrimaryImageUrl);
-                            using (Stream imageStream = await clientResponse.Content.ReadAsStreamAsync())
+                        Bitmap? imageToResize = null;
+                        
+                        BlobClient blob = blobClient.GetBlobClient($"{imdbID}_{355}px.jpg" );
+                        string? imageUrl355px = blob.Uri.AbsoluteUri;
+                        
+                        if (!blob.Exists()){
+                            try
                             {
-                                imageStream.Position = 0;
-
-                                Bitmap imageToResize = new Bitmap(imageStream);
-
-                                string imageUrl355px = await UploadFileToAzureStorageAccount(imageToResize, imdbID, 355);
-                                string imageUrl220px = await UploadFileToAzureStorageAccount(imageToResize, imdbID, 220);
-
-                                imageList.Add(ImageMovieMap(row, imageUrl355px, imageUrl220px));
+                                imageToResize = await GetImageStream(imdbPrimaryImageUrl);
+                                await UploadFileToAzureStorageAccount(blob, imageToResize, imdbID, 355);
+                            }
+                            catch (Exception ex)
+                            {
+                                logger.LogInformation(ex.Message);
+                                imageUrl355px = null;
                             }
                         }
+
+                        blob = blobClient.GetBlobClient($"{imdbID}_{220}px.jpg" );
+                        string? imageUrl220px = blob.Uri.AbsoluteUri;
+
+                        if (!blob.Exists()){
+                            try
+                            {
+                                imageToResize = imageToResize ?? await GetImageStream(imdbPrimaryImageUrl);
+                                await UploadFileToAzureStorageAccount(blob, imageToResize, imdbID, 220);
+                            }
+                            catch (Exception ex)
+                            {
+                                logger.LogInformation(ex.Message);
+                                imageUrl220px = null;
+                            }
+                        }
+
+                        imageList.Add(ImageMovieMap(row, imageUrl355px, imageUrl220px));
+
+                        if (imageToResize != null)
+                            imageToResize.Dispose();
                     }
                 }
 
@@ -78,7 +105,28 @@ namespace MyCineListFunctions
             }
         }
 
-        private static ImageMovie ImageMovieMap(DataRow row, string imageUrl355px, string imageUrl220px)
+        private static async Task<Bitmap> GetImageStream(string? imdbPrimaryImageUrl)
+        {
+            try
+            {
+                using (var client = new HttpClient())
+                {
+                    var clientResponse = await client.GetAsync(imdbPrimaryImageUrl);
+                    using (Stream imageStream = await clientResponse.Content.ReadAsStreamAsync())
+                    {
+                        imageStream.Position = 0;
+                        
+                        return new Bitmap(imageStream);
+                    }
+                }
+            }
+            catch (Exception ex) 
+            { 
+                throw new Exception($"Exception: {ex.Message} Erro ao obter a imagem: {imdbPrimaryImageUrl}", ex);
+            }
+        }
+
+        private static ImageMovie ImageMovieMap(DataRow row, string? imageUrl355px, string? imageUrl220px)
         {
             return new ImageMovie() {
                 ID = Convert.ToInt32(row["ID"]),
@@ -112,28 +160,18 @@ namespace MyCineListFunctions
             }
         }
 
-        private static async Task<string> UploadFileToAzureStorageAccount(Bitmap actualImage, string movieId, int newWidth)
+        private static async Task UploadFileToAzureStorageAccount(BlobClient blob,Bitmap actualImage, string movieId, int newWidth)
         {
-            string? Connection = Environment.GetEnvironmentVariable("AzureWebJobsStorage");
-            string? containerName = Environment.GetEnvironmentVariable("ContainerName");
-            var blobClient = new BlobContainerClient(Connection, containerName);
-            var blob = blobClient.GetBlobClient($"{movieId}_{newWidth}px.jpg" );
-
-            if (!blob.Exists())
+            int newHeight = NewProportionalHeight(actualImage.Width, actualImage.Height, newWidth);
+            Bitmap newImage = ResizeImage(actualImage, newWidth, newHeight);
+        
+            using (MemoryStream ms = new MemoryStream())
             {
-                int newHeight = NewProportionalHeight(actualImage.Width, actualImage.Height, newWidth);
-                Bitmap newImage = ResizeImage(actualImage, newWidth, newHeight);
-            
-                using (MemoryStream ms = new MemoryStream())
-                {
-                    newImage.Save(ms, ImageFormat.Jpeg);
-                    
-                    ms.Position = 0;
-                    await blob.UploadAsync(ms);
-                }
+                newImage.Save(ms, ImageFormat.Jpeg);
+                
+                ms.Position = 0;
+                await blob.UploadAsync(ms);
             }
-                    
-            return blob.Uri.AbsoluteUri;
         }
 
         private static int NewProportionalHeight (int actualWidth, int actualHeight, int newWidth)
